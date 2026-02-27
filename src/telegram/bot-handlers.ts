@@ -831,12 +831,15 @@ export const registerTelegramHandlers = ({
         const queryHtml = escapeHtml(queryText);
         clearTimeout(pending.cleanupTimer);
         researchPending.delete(queryId);
-        await ctx.answerCallbackQuery({ text: "Researching… 🔍" }).catch(() => {});
+        await ctx.answerCallbackQuery({ text: isImageIntent ? "Generating… 🎨" : "Researching… 🔍" }).catch(() => {});
         await bot.api
-          .editMessageTextInline(inlineMessageId, `<b>Q:</b> ${queryHtml}\n\n<i>🔍 Researching…</i>`, {
-            parse_mode: "HTML",
-            reply_markup: { inline_keyboard: [] },
-          })
+          .editMessageTextInline(
+            inlineMessageId,
+            isImageIntent
+              ? `<b>Q:</b> ${queryHtml}\n\n<i>🎨 Generating image, check your DM…</i>`
+              : `<b>Q:</b> ${queryHtml}\n\n<i>🔍 Researching…</i>`,
+            { parse_mode: "HTML", reply_markup: { inline_keyboard: [] } },
+          )
           .catch(() => {});
         runtime.log?.(`[telegram] inline research: starting for query_id=${queryId} sender=${senderId}`);
 
@@ -852,7 +855,14 @@ export const registerTelegramHandlers = ({
         const dmPrevTimestamp = readSessionUpdatedAt({ storePath: dmStorePath, sessionKey: dmSessionKey });
         const senderName =
           [callback.from?.first_name, callback.from?.last_name].filter(Boolean).join(" ") || senderId;
-        const researchBodyForAgent = `[Research request — skip any startup file reads, answer this question directly using web search or other relevant tools.]\n${queryText}`;
+        // Detect image-generation intent — these can't be delivered inline (editMessageTextInline
+        // is text-only), so we redirect the agent to send the result directly to the user's DM.
+        const IMAGE_INTENT_RE =
+          /\b(draw|paint|generat|creat|make|design|render|sketch|image|picture|photo|pic|illustrat|artwork|art|visuali|anime|cartoon)\w*\b/i;
+        const isImageIntent = IMAGE_INTENT_RE.test(queryText);
+        const researchBodyForAgent = isImageIntent
+          ? `[Image generation request from inline query. Generate the image and send it DIRECTLY to the user's Telegram DM using the message tool with target "${senderId}" and channel "telegram". Do NOT include the image in your reply text. After sending, reply with only a short confirmation like "📸 Sent to your DM!"]\n${queryText}`
+          : `[Research request — skip any startup file reads, answer this question directly using web search or other relevant tools.]\n${queryText}`;
         const researchBody = formatInboundEnvelope({
           channel: "Telegram",
           from: senderName,
