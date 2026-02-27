@@ -1013,6 +1013,7 @@ export const registerTelegramHandlers = ({
                   { caption: streamText.trim() || queryText, disable_notification: true },
                 );
                 const fileId = sent.photo.at(-1)!.file_id;
+                await bot.api.deleteMessage(Number(senderId), sent.message_id).catch(() => {});
                 await bot.api
                   .editMessageMediaInline(
                     inlineMessageId,
