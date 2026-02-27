@@ -68,7 +68,7 @@ import {
   parseModelCallbackData,
   type ProviderInfo,
 } from "./model-buttons.js";
-import { markdownToTelegramHtml } from "./format.js";
+import { escapeHtml, markdownToTelegramHtml } from "./format.js";
 import { buildInlineKeyboard } from "./send.js";
 import { wasSentByBot } from "./sent-message-cache.js";
 
@@ -828,11 +828,12 @@ export const registerTelegramHandlers = ({
           return;
         }
         const { queryText } = pending;
+        const queryHtml = escapeHtml(queryText);
         clearTimeout(pending.cleanupTimer);
         researchPending.delete(queryId);
         await ctx.answerCallbackQuery({ text: "Researching… 🔍" }).catch(() => {});
         await bot.api
-          .editMessageTextInline(inlineMessageId, `<b>Q:</b> ${queryText}\n\n<i>🔍 Researching…</i>`, {
+          .editMessageTextInline(inlineMessageId, `<b>Q:</b> ${queryHtml}\n\n<i>🔍 Researching…</i>`, {
             parse_mode: "HTML",
             reply_markup: { inline_keyboard: [] },
           })
@@ -891,10 +892,10 @@ export const registerTelegramHandlers = ({
           const htmlText = toHtml(text);
           const msg = _isFinal
             ? (htmlText
-                ? `<b>Q:</b> ${queryText}\n\n<b>A:</b> ${htmlText}`
-                : `<b>Q:</b> ${queryText}\n\n<i>No research results found.</i>`
+                ? `<b>Q:</b> ${queryHtml}\n\n<b>A:</b> ${htmlText}`
+                : `<b>Q:</b> ${queryHtml}\n\n<i>No research results found.</i>`
               ).slice(0, 4096)
-            : `<b>Q:</b> ${queryText}\n\n<b>A:</b> ${htmlText}…`.slice(0, 4096);
+            : `<b>Q:</b> ${queryHtml}\n\n<b>A:</b> ${htmlText}…`.slice(0, 4096);
           editChain = editChain.then(() =>
             bot.api
               .editMessageTextInline(inlineMessageId, msg, {
@@ -918,7 +919,7 @@ export const registerTelegramHandlers = ({
               ? bot.api
                   .editMessageTextInline(
                     inlineMessageId,
-                    `<b>Q:</b> ${queryText}\n\n<i>🔍 Researching… ${frame}</i>`,
+                    `<b>Q:</b> ${queryHtml}\n\n<i>🔍 Researching… ${frame}</i>`,
                     { parse_mode: "HTML", reply_markup: { inline_keyboard: [] } },
                   )
                   .catch(() => {})
@@ -968,8 +969,8 @@ export const registerTelegramHandlers = ({
             );
             const finalHtml = streamText ? toHtml(streamText) : "";
             const finalMsg = finalHtml
-              ? `<b>Q:</b> ${queryText}\n\n<b>A:</b> ${finalHtml}`.slice(0, 4096)
-              : `<b>Q:</b> ${queryText}\n\n<i>No research results found.</i>`;
+              ? `<b>Q:</b> ${queryHtml}\n\n<b>A:</b> ${finalHtml}`.slice(0, 4096)
+              : `<b>Q:</b> ${queryHtml}\n\n<i>No research results found.</i>`;
             await bot.api
               .editMessageTextInline(inlineMessageId, finalMsg, { parse_mode: "HTML", reply_markup: { inline_keyboard: [] } })
               .then(() =>
@@ -1670,10 +1671,16 @@ export const registerTelegramHandlers = ({
 
     if (fastResponse !== null) {
       runtime.log?.(`[telegram] inline_query: fast response for query_id=${query.id}`);
-      const answerText = fastResponse || "No response generated.";
-      const formattedMessage = `<b>Q:</b> ${queryText}\n\n<b>A:</b> ${answerText}`.slice(0, 4096);
-      const description =
-        answerText.length > 120 ? answerText.slice(0, 120) + "..." : answerText;
+      const answerHtml = fastResponse ? markdownToTelegramHtml(fastResponse, {}) : "";
+      const queryHtml = escapeHtml(queryText);
+      const formattedMessage = answerHtml
+        ? `<b>Q:</b> ${queryHtml}\n\n<b>A:</b> ${answerHtml}`.slice(0, 4096)
+        : `<b>Q:</b> ${queryHtml}\n\n<i>No response generated.</i>`;
+      const description = fastResponse
+        ? fastResponse.length > 120
+          ? fastResponse.slice(0, 120) + "..."
+          : fastResponse
+        : "No response generated.";
       await bot.api
         .answerInlineQuery(
           query.id,
@@ -1705,7 +1712,7 @@ export const registerTelegramHandlers = ({
               id: "timeout",
               title: `🤔 ${shortQuery}`,
               description: "Tap to continue",
-              input_message_content: { message_text: `<b>Q:</b> ${queryText}`, parse_mode: "HTML" },
+              input_message_content: { message_text: `<b>Q:</b> ${escapeHtml(queryText)}`, parse_mode: "HTML" },
               reply_markup: researchMarkup,
             },
           ],
