@@ -874,8 +874,9 @@ export const registerTelegramHandlers = ({
               `[Image generation request. Do NOT explain or ask questions — generate the image immediately using the exec tool.]`,
               `Run this command EXACTLY (no modifications):`,
               `${uvBin} run ${nanobananaScript} --prompt ${JSON.stringify(queryText)} --filename ${JSON.stringify(inlineOutputPath)} --resolution 1K${nanobananaKey ? ` --api-key ${JSON.stringify(nanobananaKey)}` : ""}`,
-              `When the command succeeds, output the file path on its own line in EXACTLY this format:`,
-              `FILE:${inlineOutputPath}`,
+              `When the command succeeds, output the file path on its own line in EXACTLY this format (replace <path> with the actual output path):`,
+              `FILE:<path>`,
+              `The output path for this request is: ${inlineOutputPath}`,
               `Then write a single short caption on the next line.`,
               `The query: ${queryText}`,
             ].join("\n")
@@ -1627,6 +1628,39 @@ export const registerTelegramHandlers = ({
     runtime.log?.(
       `[telegram] inline_query: processing query_id=${query.id} sender=${senderId} text="${queryText}"`,
     );
+
+    // Short-circuit image-intent queries: skip LLM, answer immediately with placeholder
+    const INLINE_IMAGE_INTENT_RE =
+      /\b(draw|paint|generat|creat|make|design|render|sketch|image|picture|photo|pic|illustrat|artwork|art|visuali|anime|cartoon)\w*\b/i;
+    if (INLINE_IMAGE_INTENT_RE.test(queryText)) {
+      const shortQuery2 = queryText.length > 50 ? queryText.slice(0, 50) + "..." : queryText;
+      const inlineQueryHtml2 = queryText.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const researchMarkup2 = buildResearchMarkup(query.id);
+      const researchCleanup2 = setTimeout(() => researchPending.delete(query.id), 10 * 60 * 1000);
+      researchPending.set(query.id, { queryText, cleanupTimer: researchCleanup2 });
+      await bot.api
+        .answerInlineQuery(
+          query.id,
+          [
+            {
+              type: "article",
+              id: query.id,
+              title: `🎨 ${shortQuery2}`,
+              description: "Tap to generate image",
+              input_message_content: {
+                message_text: `<b>Q:</b> ${inlineQueryHtml2}\n\n<i>🎨 Generating your image…</i>`,
+                parse_mode: "HTML",
+              },
+              reply_markup: researchMarkup2,
+            },
+          ],
+          { cache_time: 0 },
+        )
+        .catch((err: unknown) => {
+          runtime.error?.(danger(`[telegram] answerInlineQuery (image placeholder) failed: ${String(err)}`));
+        });
+      return;
+    }
 
     // Each inline query uses its own ephemeral session keyed by sender — no cross-query history
     const route = resolveAgentRoute({
