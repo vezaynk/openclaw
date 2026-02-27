@@ -830,6 +830,9 @@ export const registerTelegramHandlers = ({
         }
         const { queryText } = pending;
         const queryHtml = escapeHtml(queryText);
+        const IMAGE_INTENT_RE =
+          /\b(draw|paint|generat|creat|make|design|render|sketch|image|picture|photo|pic|illustrat|artwork|art|visuali|anime|cartoon)\w*\b/i;
+        const isImageIntent = IMAGE_INTENT_RE.test(queryText);
         clearTimeout(pending.cleanupTimer);
         researchPending.delete(queryId);
         await ctx.answerCallbackQuery({ text: isImageIntent ? "Generating… 🎨" : "Researching… 🔍" }).catch(() => {});
@@ -856,11 +859,6 @@ export const registerTelegramHandlers = ({
         const dmPrevTimestamp = readSessionUpdatedAt({ storePath: dmStorePath, sessionKey: dmSessionKey });
         const senderName =
           [callback.from?.first_name, callback.from?.last_name].filter(Boolean).join(" ") || senderId;
-        // Detect image-generation intent — these can't be delivered inline (editMessageTextInline
-        // is text-only), so we redirect the agent to send the result directly to the user's DM.
-        const IMAGE_INTENT_RE =
-          /\b(draw|paint|generat|creat|make|design|render|sketch|image|picture|photo|pic|illustrat|artwork|art|visuali|anime|cartoon)\w*\b/i;
-        const isImageIntent = IMAGE_INTENT_RE.test(queryText);
         // For image intent, build an explicit nanobanana command so the stateless
         // inline session doesn't need to read skills or figure out paths itself.
         const nanobananaKey =
