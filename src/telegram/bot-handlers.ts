@@ -1,4 +1,5 @@
 import type { Message, ReactionTypeEmoji } from "@grammyjs/types";
+import { InputFile } from "grammy";
 import { resolveAgentDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
 import { hasControlCommand } from "../auto-reply/command-detection.js";
 import { formatInboundEnvelope, resolveEnvelopeFormatOptions } from "../auto-reply/envelope.js";
@@ -861,7 +862,7 @@ export const registerTelegramHandlers = ({
           /\b(draw|paint|generat|creat|make|design|render|sketch|image|picture|photo|pic|illustrat|artwork|art|visuali|anime|cartoon)\w*\b/i;
         const isImageIntent = IMAGE_INTENT_RE.test(queryText);
         const researchBodyForAgent = isImageIntent
-          ? `[Image generation request from inline query. Generate the image and send it DIRECTLY to the user's Telegram DM using the message tool with target "${senderId}" and channel "telegram". Do NOT include the image in your reply text. After sending, reply with only a short confirmation like "📸 Sent to your DM!"]\n${queryText}`
+          ? `[Image generation request from inline query. Generate the image using available tools and save it to a file. When done, output the absolute file path on its own line in EXACTLY this format (no other text on that line):\nFILE:/absolute/path/to/image.png\nThen provide a short caption on the next line.]\n${queryText}`
           : `[Research request — skip any startup file reads, answer this question directly using web search or other relevant tools.]\n${queryText}`;
         const researchBody = formatInboundEnvelope({
           channel: "Telegram",
@@ -895,6 +896,8 @@ export const registerTelegramHandlers = ({
 
         const STREAM_INTERVAL_MS = 2000;
         let streamText = "";
+        let detectedImagePath: string | null = null;
+        const FILE_LINE_RE = /^FILE:(\/\S+\.(?:png|jpg|jpeg|gif|webp))$/im;
         let lastEdit = 0;
         let editChain = Promise.resolve();
         const toHtml = (md: string) => markdownToTelegramHtml(md, {});
@@ -948,7 +951,13 @@ export const registerTelegramHandlers = ({
                 spinnerActive = false;
                 clearInterval(spinnerInterval);
               }
-              streamText += (streamText ? "\n\n" : "") + payload.text;
+              // Extract FILE: path before adding to streamText
+              const fileMatch = FILE_LINE_RE.exec(payload.text);
+              if (fileMatch) {
+                detectedImagePath = fileMatch[1];
+              }
+              const cleanedText = payload.text.replace(FILE_LINE_RE, "").trim();
+              streamText += (streamText ? "\n\n" : "") + cleanedText;
               const now = Date.now();
               if (deferTimer === null && now - lastEdit >= STREAM_INTERVAL_MS) {
                 lastEdit = now;
@@ -975,8 +984,39 @@ export const registerTelegramHandlers = ({
             }
             await editChain;
             runtime.log?.(
-              `[telegram] inline research: done query_id=${queryId} streamText=${streamText.length}chars`,
+              `[telegram] inline research: done query_id=${queryId} streamText=${streamText.length}chars imagePath=${detectedImagePath ?? "none"}`,
             );
+
+            // Image path detected — upload via sendPhoto to get a file_id, then editMessageMediaInline
+            if (detectedImagePath) {
+              try {
+                const sent = await bot.api.sendPhoto(
+                  Number(senderId),
+                  new InputFile(detectedImagePath),
+                  { caption: streamText.trim() || queryText, disable_notification: true },
+                );
+                const fileId = sent.photo.at(-1)!.file_id;
+                await bot.api
+                  .editMessageMediaInline(
+                    inlineMessageId,
+                    { type: "photo", media: fileId, caption: streamText.trim() || queryText },
+                  )
+                  .then(() => runtime.log?.(`[telegram] inline research: image edit ok query_id=${queryId}`))
+                  .catch((err) =>
+                    runtime.error?.(danger(`[telegram] inline research: image edit failed query_id=${queryId}: ${String(err)}`)),
+                  );
+              } catch (err) {
+                runtime.error?.(danger(`[telegram] inline research: image upload failed query_id=${queryId}: ${String(err)}`));
+                // Fall back to text edit
+                const fallbackHtml = streamText ? toHtml(streamText) : "";
+                const fallbackMsg = fallbackHtml
+                  ? `<b>Q:</b> ${queryHtml}\n\n<b>A:</b> ${fallbackHtml}`.slice(0, 4096)
+                  : `<b>Q:</b> ${queryHtml}\n\n<i>Image generation failed.</i>`;
+                await bot.api.editMessageTextInline(inlineMessageId, fallbackMsg, { parse_mode: "HTML", reply_markup: { inline_keyboard: [] } }).catch(() => {});
+              }
+              return;
+            }
+
             const finalHtml = streamText ? toHtml(streamText) : "";
             const finalMsg = finalHtml
               ? `<b>Q:</b> ${queryHtml}\n\n<b>A:</b> ${finalHtml}`.slice(0, 4096)
@@ -984,15 +1024,11 @@ export const registerTelegramHandlers = ({
             await bot.api
               .editMessageTextInline(inlineMessageId, finalMsg, { parse_mode: "HTML", reply_markup: { inline_keyboard: [] } })
               .then(() =>
-                runtime.log?.(
-                  `[telegram] inline research: final edit ok query_id=${queryId}`,
-                ),
+                runtime.log?.(`[telegram] inline research: final edit ok query_id=${queryId}`),
               )
               .catch((err) =>
                 runtime.error?.(
-                  danger(
-                    `[telegram] inline research: final edit failed query_id=${queryId}: ${String(err)}`,
-                  ),
+                  danger(`[telegram] inline research: final edit failed query_id=${queryId}: ${String(err)}`),
                 ),
               );
           })
