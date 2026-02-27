@@ -1,6 +1,9 @@
 import type { Message, ReactionTypeEmoji } from "@grammyjs/types";
 import { resolveAgentDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
 import { hasControlCommand } from "../auto-reply/command-detection.js";
+import { formatInboundEnvelope, resolveEnvelopeFormatOptions } from "../auto-reply/envelope.js";
+import { finalizeInboundContext } from "../auto-reply/reply/inbound-context.js";
+import { dispatchReplyWithBufferedBlockDispatcher } from "../auto-reply/reply/provider-dispatcher.js";
 import {
   createInboundDebouncer,
   resolveInboundDebounceMs,
@@ -16,7 +19,12 @@ import { buildCommandsMessagePaginated } from "../auto-reply/status.js";
 import { resolveChannelConfigWrites } from "../channels/plugins/config-writes.js";
 import { loadConfig } from "../config/config.js";
 import { writeConfigFile } from "../config/io.js";
-import { loadSessionStore, resolveStorePath } from "../config/sessions.js";
+import {
+  loadSessionStore,
+  readSessionUpdatedAt,
+  recordSessionMetaFromInbound,
+  resolveStorePath,
+} from "../config/sessions.js";
 import type { TelegramGroupConfig, TelegramTopicConfig } from "../config/types.js";
 import { danger, logVerbose, warn } from "../globals.js";
 import { enqueueSystemEvent } from "../infra/system-events.js";
@@ -60,6 +68,7 @@ import {
   parseModelCallbackData,
   type ProviderInfo,
 } from "./model-buttons.js";
+import { markdownToTelegramHtml } from "./format.js";
 import { buildInlineKeyboard } from "./send.js";
 import { wasSentByBot } from "./sent-message-cache.js";
 
@@ -396,6 +405,24 @@ export const registerTelegramHandlers = ({
 
   const loadStoreAllowFrom = async () =>
     readChannelAllowFromStore("telegram", process.env, accountId).catch(() => []);
+
+  // ── Inline query state ────────────────────────────────────────────────────
+  const RESEARCH_CB_PREFIX = "inlr:";
+  const buildResearchMarkup = (queryId: string) => ({
+    inline_keyboard: [[{ text: "🔍 Research more", callback_data: `${RESEARCH_CB_PREFIX}${queryId}` }]],
+  });
+
+  const inlineDebounceMs = 400;
+  const inlineDebounceTimers = new Map<string, { timer: ReturnType<typeof setTimeout>; queryId: string }>();
+
+  // inlinePending: slow-path only — resolves inline_message_id so the ⏳ placeholder can be edited
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const inlinePendingMs = 60000;
+  const inlinePending = new Map<string, { resolveMessageId: (id: string) => void; cleanupTimer: ReturnType<typeof setTimeout> }>();
+
+  // researchPending: stores { queryText } keyed by query.id so the research callback can look up the original question
+  const researchPending = new Map<string, { queryText: string; cleanupTimer: ReturnType<typeof setTimeout> }>();
+  // ─────────────────────────────────────────────────────────────────────────
 
   const isAllowlistAuthorized = (
     allow: NormalizedAllowFrom,
@@ -786,6 +813,185 @@ export const registerTelegramHandlers = ({
     if (shouldSkipUpdate(ctx)) {
       return;
     }
+
+    // Inline research callbacks come from inline result messages — no callbackMessage, only inline_message_id.
+    // Handle them before the normal flow which would discard them (no callbackMessage).
+    {
+      const cbData = (callback.data ?? "").trim();
+      if (cbData.startsWith(RESEARCH_CB_PREFIX)) {
+        const queryId = cbData.slice(RESEARCH_CB_PREFIX.length);
+        const inlineMessageId = callback.inline_message_id;
+        const senderId = String(callback.from?.id ?? "");
+        const pending = researchPending.get(queryId);
+        if (!pending || !inlineMessageId) {
+          await ctx.answerCallbackQuery({ text: "This query has expired." }).catch(() => {});
+          return;
+        }
+        const { queryText } = pending;
+        clearTimeout(pending.cleanupTimer);
+        researchPending.delete(queryId);
+        await ctx.answerCallbackQuery({ text: "Researching… 🔍" }).catch(() => {});
+        await bot.api
+          .editMessageTextInline(inlineMessageId, `<b>Q:</b> ${queryText}\n\n<i>🔍 Researching…</i>`, {
+            parse_mode: "HTML",
+            reply_markup: { inline_keyboard: [] },
+          })
+          .catch(() => {});
+        runtime.log?.(`[telegram] inline research: starting for query_id=${queryId} sender=${senderId}`);
+
+        // Use inline session (not DM) — avoids Telegram DM delivery side-effects while still having tool access
+        const dmRoute = resolveAgentRoute({
+          cfg,
+          channel: "telegram",
+          accountId,
+          peer: { kind: "inline", id: senderId },
+        });
+        const dmSessionKey = dmRoute.sessionKey;
+        const dmStorePath = resolveStorePath(cfg.session?.store, { agentId: dmRoute.agentId });
+        const dmPrevTimestamp = readSessionUpdatedAt({ storePath: dmStorePath, sessionKey: dmSessionKey });
+        const senderName =
+          [callback.from?.first_name, callback.from?.last_name].filter(Boolean).join(" ") || senderId;
+        const researchBodyForAgent = `[Research request — skip any startup file reads, answer this question directly using web search or other relevant tools.]\n${queryText}`;
+        const researchBody = formatInboundEnvelope({
+          channel: "Telegram",
+          from: senderName,
+          timestamp: Date.now(),
+          body: researchBodyForAgent,
+          chatType: "direct",
+          sender: { name: senderName, id: senderId || undefined },
+          previousTimestamp: dmPrevTimestamp,
+          envelope: resolveEnvelopeFormatOptions(cfg),
+        });
+        const researchCtx = finalizeInboundContext({
+          Body: researchBody,
+          BodyForAgent: researchBodyForAgent,
+          RawBody: queryText,
+          From: `telegram:${senderId}`,
+          To: `telegram:${senderId}`,
+          ChatType: "direct",
+          SenderName: senderName,
+          SenderId: senderId || undefined,
+          Surface: "telegram",
+          Provider: "telegram",
+          MessageSid: `${queryId}_research`,
+          Timestamp: Date.now(),
+          WasMentioned: true,
+          SessionKey: dmSessionKey,
+          AccountId: dmRoute.accountId,
+          OriginatingChannel: "telegram",
+          OriginatingTo: `telegram:${senderId}`,
+        });
+
+        const STREAM_INTERVAL_MS = 2000;
+        let streamText = "";
+        let lastEdit = 0;
+        let editChain = Promise.resolve();
+        const toHtml = (md: string) => markdownToTelegramHtml(md, {});
+        const queueEdit = (text: string, _isFinal: boolean) => {
+          const htmlText = toHtml(text);
+          const msg = _isFinal
+            ? (htmlText
+                ? `<b>Q:</b> ${queryText}\n\n<b>A:</b> ${htmlText}`
+                : `<b>Q:</b> ${queryText}\n\n<i>No research results found.</i>`
+              ).slice(0, 4096)
+            : `<b>Q:</b> ${queryText}\n\n<b>A:</b> ${htmlText}…`.slice(0, 4096);
+          editChain = editChain.then(() =>
+            bot.api
+              .editMessageTextInline(inlineMessageId, msg, {
+                parse_mode: "HTML",
+                reply_markup: { inline_keyboard: [] },
+              })
+              .catch(() => {}),
+          );
+        };
+
+        // Spinner animation — cycles while waiting for first text block
+        const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let spinnerIdx = 0;
+        let spinnerActive = true;
+        const spinnerInterval = setInterval(() => {
+          if (!spinnerActive || streamText) return;
+          spinnerIdx = (spinnerIdx + 1) % SPINNER_FRAMES.length;
+          const frame = SPINNER_FRAMES[spinnerIdx];
+          editChain = editChain.then(() =>
+            spinnerActive && !streamText
+              ? bot.api
+                  .editMessageTextInline(
+                    inlineMessageId,
+                    `<b>Q:</b> ${queryText}\n\n<i>🔍 Researching… ${frame}</i>`,
+                    { parse_mode: "HTML", reply_markup: { inline_keyboard: [] } },
+                  )
+                  .catch(() => {})
+              : Promise.resolve(),
+          );
+        }, 1000);
+
+        let deferTimer: ReturnType<typeof setTimeout> | null = null;
+        dispatchReplyWithBufferedBlockDispatcher({
+          ctx: researchCtx,
+          cfg,
+          dispatcherOptions: {
+            deliver: async (payload) => {
+              if (!payload.text) return;
+              if (spinnerActive) {
+                spinnerActive = false;
+                clearInterval(spinnerInterval);
+              }
+              streamText += (streamText ? "\n\n" : "") + payload.text;
+              const now = Date.now();
+              if (deferTimer === null && now - lastEdit >= STREAM_INTERVAL_MS) {
+                lastEdit = now;
+                queueEdit(streamText, false);
+              } else if (deferTimer === null) {
+                deferTimer = setTimeout(() => {
+                  deferTimer = null;
+                  lastEdit = Date.now();
+                  queueEdit(streamText, false);
+                }, STREAM_INTERVAL_MS - (Date.now() - lastEdit));
+              }
+            },
+            onError: (err) =>
+              runtime.error?.(danger(`[telegram] inline research dispatch failed: ${String(err)}`)),
+          },
+          replyOptions: {},
+        })
+          .then(async () => {
+            spinnerActive = false;
+            clearInterval(spinnerInterval);
+            if (deferTimer !== null) {
+              clearTimeout(deferTimer);
+              deferTimer = null;
+            }
+            await editChain;
+            runtime.log?.(
+              `[telegram] inline research: done query_id=${queryId} streamText=${streamText.length}chars`,
+            );
+            const finalHtml = streamText ? toHtml(streamText) : "";
+            const finalMsg = finalHtml
+              ? `<b>Q:</b> ${queryText}\n\n<b>A:</b> ${finalHtml}`.slice(0, 4096)
+              : `<b>Q:</b> ${queryText}\n\n<i>No research results found.</i>`;
+            await bot.api
+              .editMessageTextInline(inlineMessageId, finalMsg, { parse_mode: "HTML", reply_markup: { inline_keyboard: [] } })
+              .then(() =>
+                runtime.log?.(
+                  `[telegram] inline research: final edit ok query_id=${queryId}`,
+                ),
+              )
+              .catch((err) =>
+                runtime.error?.(
+                  danger(
+                    `[telegram] inline research: final edit failed query_id=${queryId}: ${String(err)}`,
+                  ),
+                ),
+              );
+          })
+          .catch((err) =>
+            runtime.error?.(danger(`[telegram] inline research failed: ${String(err)}`)),
+          );
+        return;
+      }
+    }
+
     const answerCallbackQuery =
       typeof (ctx as { answerCallbackQuery?: unknown }).answerCallbackQuery === "function"
         ? () => ctx.answerCallbackQuery()
@@ -1302,4 +1508,237 @@ export const registerTelegramHandlers = ({
       errorMessage: "channel_post handler failed",
     });
   });
+
+  // ── Inline query handler ─────────────────────────────────────────────────
+  bot.on("inline_query", async (ctx) => {
+    const receivedAt = (ctx as typeof ctx & { inlineQueryReceivedAt?: number }).inlineQueryReceivedAt ?? Date.now();
+    const query = ctx.inlineQuery;
+    if (!query) return;
+
+    const senderId = String(query.from?.id ?? "");
+    const senderUsername = query.from?.username ?? "";
+    const dmPolicy = telegramCfg.dmPolicy ?? "pairing";
+    const storeAllowFrom = await loadStoreAllowFrom();
+    const dmAllow = normalizeAllowFromWithStore({ allowFrom, storeAllowFrom, dmPolicy });
+    const senderAllowed =
+      dmPolicy === "open" || isSenderAllowed({ allow: dmAllow, senderId, senderUsername });
+    if (!senderAllowed) {
+      await bot.api.answerInlineQuery(query.id, [], { cache_time: 0 }).catch(() => {});
+      return;
+    }
+
+    const queryText = query.query?.trim() ?? "";
+    if (!queryText) {
+      await bot.api
+        .answerInlineQuery(
+          query.id,
+          [
+            {
+              type: "article",
+              id: "ask",
+              title: "Type a question to ask the assistant...",
+              description: "Start typing after the bot name",
+              input_message_content: { message_text: "..." },
+            },
+          ],
+          { cache_time: 0 },
+        )
+        .catch(() => {});
+      return;
+    }
+
+    // Debounce: cancel previous timer for the same sender and wait before processing
+    const pendingDebounce = inlineDebounceTimers.get(senderId);
+    if (pendingDebounce) {
+      clearTimeout(pendingDebounce.timer);
+      inlineDebounceTimers.delete(senderId);
+    }
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, inlineDebounceMs);
+      inlineDebounceTimers.set(senderId, { timer, queryId: query.id });
+    });
+    const currentDebounce = inlineDebounceTimers.get(senderId);
+    if (!currentDebounce || currentDebounce.queryId !== query.id) return;
+    inlineDebounceTimers.delete(senderId);
+
+    runtime.log?.(
+      `[telegram] inline_query: processing query_id=${query.id} sender=${senderId} text="${queryText}"`,
+    );
+
+    // Each inline query uses its own ephemeral session keyed by sender — no cross-query history
+    const route = resolveAgentRoute({
+      cfg,
+      channel: "telegram",
+      accountId,
+      peer: { kind: "inline", id: query.id },
+    });
+    const sessionKey = route.sessionKey;
+    const storePath = resolveStorePath(cfg.session?.store, { agentId: route.agentId });
+    const previousTimestamp = readSessionUpdatedAt({ storePath, sessionKey });
+    const envelopeOptions = resolveEnvelopeFormatOptions(cfg);
+    const senderName =
+      [query.from?.first_name, query.from?.last_name].filter(Boolean).join(" ") ||
+      senderUsername ||
+      senderId;
+
+    // Quick answer: instruct model to answer without tools
+    const quickBodyForAgent = `[Inline query — answer directly and concisely in 1-3 sentences. Do not use any tools.]\n${queryText}`;
+    const body = formatInboundEnvelope({
+      channel: "Telegram",
+      from: senderName,
+      timestamp: Date.now(),
+      body: quickBodyForAgent,
+      chatType: "direct",
+      sender: { name: senderName, username: senderUsername || undefined, id: senderId || undefined },
+      previousTimestamp,
+      envelope: envelopeOptions,
+    });
+
+    try {
+      await recordSessionMetaFromInbound({
+        storePath,
+        sessionKey,
+        ctx: {
+          From: `telegram:${senderId}`,
+          To: `telegram:${senderId}`,
+          Surface: "telegram",
+          Provider: "telegram",
+          SenderName: senderName,
+          SenderId: senderId || undefined,
+          SenderUsername: senderUsername || undefined,
+        },
+      });
+    } catch (err) {
+      runtime.error?.(danger(`[telegram] inline: failed updating session meta: ${String(err)}`));
+    }
+
+    const capturedReplies: string[] = [];
+    const ctxPayload = finalizeInboundContext({
+      Body: body,
+      BodyForAgent: quickBodyForAgent,
+      RawBody: queryText,
+      From: `telegram:${senderId}`,
+      To: `telegram:${senderId}`,
+      ChatType: "direct",
+      SenderName: senderName,
+      SenderId: senderId || undefined,
+      SenderUsername: senderUsername || undefined,
+      Surface: "telegram",
+      Provider: "telegram",
+      MessageSid: query.id,
+      Timestamp: Date.now(),
+      WasMentioned: true,
+      SessionKey: sessionKey,
+      AccountId: route.accountId,
+      OriginatingChannel: "telegram",
+      OriginatingTo: `telegram:${senderId}`,
+    });
+
+    const llmPromise = dispatchReplyWithBufferedBlockDispatcher({
+      ctx: ctxPayload,
+      cfg,
+      dispatcherOptions: {
+        deliver: async (payload) => {
+          if (payload.text) capturedReplies.push(payload.text);
+        },
+        onError: (err) => {
+          runtime.error?.(danger(`[telegram] inline query dispatch failed: ${String(err)}`));
+        },
+      },
+      replyOptions: {},
+    })
+      .then(() => capturedReplies.join("\n\n").trim())
+      .catch((err) => {
+        runtime.error?.(danger(`[telegram] inline LLM failed: ${String(err)}`));
+        return "";
+      });
+
+    const TELEGRAM_DEADLINE_MS = 8000;
+    const PREVIEW_TIMEOUT_MS = Math.max(500, TELEGRAM_DEADLINE_MS - (Date.now() - receivedAt));
+    const fastResponse = await Promise.race([
+      llmPromise,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), PREVIEW_TIMEOUT_MS)),
+    ]);
+
+    const shortQuery = queryText.length > 50 ? queryText.slice(0, 50) + "..." : queryText;
+    const researchMarkup = buildResearchMarkup(query.id);
+
+    // Register in researchPending so the callback handler can find the query text.
+    // Clean up after 10 minutes whether or not research was requested.
+    const researchCleanup = setTimeout(() => researchPending.delete(query.id), 10 * 60 * 1000);
+    researchPending.set(query.id, { queryText, cleanupTimer: researchCleanup });
+
+    if (fastResponse !== null) {
+      runtime.log?.(`[telegram] inline_query: fast response for query_id=${query.id}`);
+      const answerText = fastResponse || "No response generated.";
+      const formattedMessage = `<b>Q:</b> ${queryText}\n\n<b>A:</b> ${answerText}`.slice(0, 4096);
+      const description =
+        answerText.length > 120 ? answerText.slice(0, 120) + "..." : answerText;
+      await bot.api
+        .answerInlineQuery(
+          query.id,
+          [
+            {
+              type: "article",
+              id: query.id,
+              title: `💡 ${shortQuery}`,
+              description,
+              input_message_content: { message_text: formattedMessage, parse_mode: "HTML" },
+              reply_markup: researchMarkup,
+            },
+          ],
+          { cache_time: 0 },
+        )
+        .catch((err) => {
+          runtime.error?.(danger(`[telegram] answerInlineQuery failed: ${String(err)}`));
+        });
+    } else {
+      runtime.log?.(
+        `[telegram] inline_query: timeout, returning fallback for query_id=${query.id}`,
+      );
+      await bot.api
+        .answerInlineQuery(
+          query.id,
+          [
+            {
+              type: "article",
+              id: "timeout",
+              title: `🤔 ${shortQuery}`,
+              description: "Tap to continue",
+              input_message_content: { message_text: `<b>Q:</b> ${queryText}`, parse_mode: "HTML" },
+              reply_markup: researchMarkup,
+            },
+          ],
+          { cache_time: 0 },
+        )
+        .then(() => {
+          runtime.log?.(
+            `[telegram] inline_query: fallback answer sent ok for query_id=${query.id}`,
+          );
+        })
+        .catch((err) => {
+          runtime.error?.(
+            danger(
+              `[telegram] inline_query: fallback answerInlineQuery failed for query_id=${query.id}: ${String(err)}`,
+            ),
+          );
+        });
+    }
+  });
+
+  bot.on("chosen_inline_result", async (ctx) => {
+    // Only needed for the slow path: resolves inline_message_id so the ⏳ placeholder can be
+    // edited to the quick answer. Fast-path queries don't register in inlinePending.
+    const result = ctx.chosenInlineResult;
+    runtime.log?.(
+      `[telegram] chosen_inline_result: result_id=${result?.result_id} inline_message_id=${result?.inline_message_id ?? "none"}`,
+    );
+    if (!result?.inline_message_id) return;
+    const pending = inlinePending.get(result.result_id);
+    if (!pending) return; // fast path — no edit needed
+    clearTimeout(pending.cleanupTimer);
+    inlinePending.delete(result.result_id);
+    pending.resolveMessageId(result.inline_message_id);
+  });
+  // ─────────────────────────────────────────────────────────────────────────
 };
