@@ -861,8 +861,26 @@ export const registerTelegramHandlers = ({
         const IMAGE_INTENT_RE =
           /\b(draw|paint|generat|creat|make|design|render|sketch|image|picture|photo|pic|illustrat|artwork|art|visuali|anime|cartoon)\w*\b/i;
         const isImageIntent = IMAGE_INTENT_RE.test(queryText);
+        // For image intent, build an explicit nanobanana command so the stateless
+        // inline session doesn't need to read skills or figure out paths itself.
+        const nanobananaKey =
+          (cfg as unknown as { skills?: { entries?: Record<string, { apiKey?: string }> } })
+            .skills?.entries?.["nano-banana-pro"]?.apiKey ?? "";
+        const homeDir = process.env.HOME ?? "/home/linuxuser";
+        const nanobananaScript = `${homeDir}/.openclaw/workspace/skills/nano-banana-pro/scripts/generate_image.py`;
+        const uvBin = `${homeDir}/.local/bin/uv`;
+        const inlineOutputPath = `/tmp/inline-img-${Date.now()}.png`;
+
         const researchBodyForAgent = isImageIntent
-          ? `[Image generation request from inline query. Generate the image using available tools and save it to a file. When done, output the absolute file path on its own line in EXACTLY this format (no other text on that line):\nFILE:/absolute/path/to/image.png\nThen provide a short caption on the next line.]\n${queryText}`
+          ? [
+              `[Image generation request. Do NOT explain or ask questions — generate the image immediately using the exec tool.]`,
+              `Run this command EXACTLY (no modifications):`,
+              `${uvBin} run ${nanobananaScript} --prompt ${JSON.stringify(queryText)} --filename ${JSON.stringify(inlineOutputPath)} --resolution 1K${nanobananaKey ? ` --api-key ${JSON.stringify(nanobananaKey)}` : ""}`,
+              `When the command succeeds, output the file path on its own line in EXACTLY this format:`,
+              `FILE:${inlineOutputPath}`,
+              `Then write a single short caption on the next line.`,
+              `The query: ${queryText}`,
+            ].join("\n")
           : `[Research request — skip any startup file reads, answer this question directly using web search or other relevant tools.]\n${queryText}`;
         const researchBody = formatInboundEnvelope({
           channel: "Telegram",
