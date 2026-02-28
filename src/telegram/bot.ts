@@ -68,6 +68,7 @@ export function getTelegramSequentialKey(ctx: {
   message?: Message;
   channelPost?: Message;
   editedChannelPost?: Message;
+  inlineQuery?: unknown;
   update?: {
     message?: Message;
     edited_message?: Message;
@@ -76,7 +77,9 @@ export function getTelegramSequentialKey(ctx: {
     callback_query?: { message?: Message };
     message_reaction?: { chat?: { id?: number } };
   };
-}): string {
+}): string | string[] {
+  // Inline queries have no chat context and must not be serialized
+  if (ctx.inlineQuery) return [];
   // Handle reaction updates
   const reaction = ctx.update?.message_reaction;
   if (reaction?.chat?.id) {
@@ -214,6 +217,13 @@ export function createTelegramBot(opts: TelegramBotOptions) {
         maybePersistSafeWatermark();
       }
     }
+  });
+
+  // Record inline query received time before sequentialize so handlers can compute deadline
+  bot.use((ctx, next) => {
+    if (ctx.inlineQuery)
+      (ctx as typeof ctx & { inlineQueryReceivedAt?: number }).inlineQueryReceivedAt = Date.now();
+    return next();
   });
 
   bot.use(sequentialize(getTelegramSequentialKey));

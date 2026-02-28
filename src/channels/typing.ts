@@ -17,6 +17,10 @@ export function createTypingCallbacks(params: {
   const stop = params.stop;
   const keepaliveIntervalMs = params.keepaliveIntervalMs ?? 3_000;
   let stopSent = false;
+  // Track whether fireStop has been called so that an in-flight onReplyStart
+  // (awaiting the async start() call) cannot restart the keepalive loop after
+  // cleanup has already run.
+  let stopped = false;
 
   const fireStart = async () => {
     try {
@@ -32,13 +36,20 @@ export function createTypingCallbacks(params: {
   });
 
   const onReplyStart = async () => {
+    if (stopped) {
+      return;
+    }
     stopSent = false;
     keepaliveLoop.stop();
     await fireStart();
-    keepaliveLoop.start();
+    // Guard again after the async fireStart — cleanup may have run while we were awaiting.
+    if (!stopped) {
+      keepaliveLoop.start();
+    }
   };
 
   const fireStop = () => {
+    stopped = true;
     keepaliveLoop.stop();
     if (!stop || stopSent) {
       return;
