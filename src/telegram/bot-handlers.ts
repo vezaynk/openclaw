@@ -412,6 +412,9 @@ export const registerTelegramHandlers = ({
   const buildResearchMarkup = (queryId: string) => ({
     inline_keyboard: [[{ text: "🔍 Research more", callback_data: `${RESEARCH_CB_PREFIX}${queryId}` }]],
   });
+  const buildImageResearchMarkup = (queryId: string) => ({
+    inline_keyboard: [[{ text: "🎨 Generate it!", callback_data: `${RESEARCH_CB_PREFIX}${queryId}` }]],
+  });
 
   const inlineDebounceMs = 400;
   const inlineDebounceTimers = new Map<string, { timer: ReturnType<typeof setTimeout>; queryId: string }>();
@@ -840,7 +843,7 @@ export const registerTelegramHandlers = ({
           .editMessageTextInline(
             inlineMessageId,
             isImageIntent
-              ? `<b>Q:</b> ${queryHtml}\n\n<i>🎨 Generating image, check your DM…</i>`
+              ? `<b>Q:</b> ${queryHtml}\n\n<i>🖌️ Drawing…</i>`
               : `<b>Q:</b> ${queryHtml}\n\n<i>🔍 Researching…</i>`,
             { parse_mode: "HTML", reply_markup: { inline_keyboard: [] } },
           )
@@ -949,7 +952,9 @@ export const registerTelegramHandlers = ({
               ? bot.api
                   .editMessageTextInline(
                     inlineMessageId,
-                    `<b>Q:</b> ${queryHtml}\n\n<i>🔍 Researching… ${frame}</i>`,
+                    isImageIntent
+                      ? `<b>Q:</b> ${queryHtml}\n\n<i>🖌️ Drawing…</i>`
+                      : `<b>Q:</b> ${queryHtml}\n\n<i>🔍 Researching… ${frame}</i>`,
                     { parse_mode: "HTML", reply_markup: { inline_keyboard: [] } },
                   )
                   .catch(() => {})
@@ -1636,7 +1641,7 @@ export const registerTelegramHandlers = ({
     if (INLINE_IMAGE_INTENT_RE.test(queryText)) {
       const shortQuery2 = queryText.length > 50 ? queryText.slice(0, 50) + "..." : queryText;
       const inlineQueryHtml2 = queryText.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-      const researchMarkup2 = buildResearchMarkup(query.id);
+      const researchMarkup2 = buildImageResearchMarkup(query.id);
       const researchCleanup2 = setTimeout(() => researchPending.delete(query.id), 10 * 60 * 1000);
       researchPending.set(query.id, { queryText, cleanupTimer: researchCleanup2 });
       await bot.api
@@ -1647,9 +1652,9 @@ export const registerTelegramHandlers = ({
               type: "article",
               id: query.id,
               title: `🎨 ${shortQuery2}`,
-              description: "Tap to generate image",
+              description: "Tap to send, then tap Generate it! to create",
               input_message_content: {
-                message_text: `<b>Q:</b> ${inlineQueryHtml2}\n\n<i>🎨 Generating your image…</i>`,
+                message_text: `<b>🎨 ${inlineQueryHtml2}</b>\n\n<i>Tap <b>Generate it!</b> below to create your image.</i>`,
                 parse_mode: "HTML",
               },
               reply_markup: researchMarkup2,
