@@ -2225,7 +2225,12 @@ export const registerTelegramHandlers = ({
         MessageSid: query.id,
         Timestamp: Date.now(),
         WasMentioned: true,
-        SessionKey: `inline:image:${senderId}`,
+        SessionKey: resolveAgentRoute({
+          cfg,
+          channel: "telegram",
+          accountId,
+          peer: { kind: "dm", id: senderId },
+        }).sessionKey,
         AccountId: accountId,
         OriginatingChannel: "telegram",
         OriginatingTo: `telegram:${senderId}`,
