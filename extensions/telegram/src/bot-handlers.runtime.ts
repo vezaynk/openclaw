@@ -2175,6 +2175,10 @@ export const registerTelegramHandlers = ({
                 message_text: `<b>🎨 ${inlineQueryHtml2}</b>\n\n<i>🖌️ Generating…</i>`,
                 parse_mode: "HTML",
               },
+              // reply_markup required for Telegram to include inline_message_id in chosen_inline_result
+              reply_markup: {
+                inline_keyboard: [[{ text: "🖌️ Generating…", callback_data: "noop" }]],
+              },
             },
           ],
           { cache_time: 0 },
