@@ -498,14 +498,6 @@ export const registerTelegramHandlers = ({
     { timer: ReturnType<typeof setTimeout>; queryId: string }
   >();
 
-  // inlinePending: slow-path only — resolves inline_message_id so the ⏳ placeholder can be edited
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const inlinePendingMs = 60000;
-  const inlinePending = new Map<
-    string,
-    { resolveMessageId: (id: string) => void; cleanupTimer: ReturnType<typeof setTimeout> }
-  >();
-
   // researchPending: stores { queryText } keyed by query.id so the research callback can look up the original question
   const researchPending = new Map<
     string,
@@ -1140,7 +1132,9 @@ export const registerTelegramHandlers = ({
           await ctx.answerCallbackQuery({ text: "This query has expired." }).catch(() => {});
           return;
         }
-        const { queryText } = pending;
+        const { queryText: rawQueryText } = pending;
+        // Strip shell metacharacters to prevent prompt injection via user-controlled input
+        const queryText = rawQueryText.replace(/[`$\\|&;(){}<>!]/g, "");
         const queryHtml = escapeHtml(queryText);
         const IMAGE_INTENT_RE =
           /\b(draw|paint|generat|creat|make|design|render|sketch|image|picture|photo|pic|illustrat|artwork|art|visuali|anime|cartoon)\w*\b/i;
@@ -2341,7 +2335,7 @@ export const registerTelegramHandlers = ({
           [
             {
               type: "article",
-              id: "timeout",
+              id: query.id,
               title: `🤔 ${shortQuery}`,
               description: "Tap to continue",
               input_message_content: {
@@ -2368,17 +2362,5 @@ export const registerTelegramHandlers = ({
     }
   });
 
-  bot.on("chosen_inline_result", async (ctx) => {
-    const result = ctx.chosenInlineResult;
-    runtime.log?.(
-      `[telegram] chosen_inline_result: result_id=${result?.result_id} inline_message_id=${result?.inline_message_id ?? "none"}`,
-    );
-    if (!result?.inline_message_id) return;
-    const pending = inlinePending.get(result.result_id);
-    if (!pending) return;
-    clearTimeout(pending.cleanupTimer);
-    inlinePending.delete(result.result_id);
-    pending.resolveMessageId(result.inline_message_id);
-  });
   // ─────────────────────────────────────────────────────────────────────────
 };
