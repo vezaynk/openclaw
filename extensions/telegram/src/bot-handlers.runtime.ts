@@ -2141,8 +2141,7 @@ export const registerTelegramHandlers = ({
     );
 
     // Short-circuit image-intent queries: skip LLM, answer immediately with placeholder
-    const INLINE_IMAGE_INTENT_RE =
-      /\b(draw|paint|generat|creat|make|design|render|sketch|image|picture|photo|pic|illustrat|artwork|art|visuali|anime|cartoon)\w*\b/i;
+    const INLINE_IMAGE_INTENT_RE = /^draw\b/i;
     if (INLINE_IMAGE_INTENT_RE.test(queryText)) {
       const shortQuery2 = queryText.length > 50 ? queryText.slice(0, 50) + "..." : queryText;
       const inlineQueryHtml2 = escapeHtml(queryText);
