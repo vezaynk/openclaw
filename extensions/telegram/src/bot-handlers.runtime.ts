@@ -503,6 +503,10 @@ export const registerTelegramHandlers = ({
     string,
     { queryText: string; cleanupTimer: ReturnType<typeof setTimeout> }
   >();
+
+  // autoEditPending: keyed by query.id — resolves with inline_message_id when the user selects
+  // a timeout-path result, enabling the bot to auto-edit the message when the LLM finishes.
+  const autoEditPending = new Map<string, (inlineMessageId: string) => void>();
   // ─────────────────────────────────────────────────────────────────────────
 
   const resolveReplyMediaForMessage = async (
@@ -2329,6 +2333,15 @@ export const registerTelegramHandlers = ({
       runtime.log?.(
         `[telegram] inline_query: timeout, returning fallback for query_id=${query.id}`,
       );
+
+      // Register in autoEditPending so chosen_inline_result can deliver the inline_message_id.
+      // The LLM is still running — when it finishes and we have the message id, we auto-edit.
+      const inlineMessageIdPromise = new Promise<string>((resolve) => {
+        autoEditPending.set(query.id, resolve);
+      });
+      // Clean up if the user never selects the result (10 min TTL)
+      const autoEditCleanup = setTimeout(() => autoEditPending.delete(query.id), 10 * 60 * 1000);
+
       await bot.api
         .answerInlineQuery(
           query.id,
@@ -2337,9 +2350,9 @@ export const registerTelegramHandlers = ({
               type: "article",
               id: query.id,
               title: `🤔 ${shortQuery}`,
-              description: "Tap to continue",
+              description: "Tap to continue — answer arriving shortly",
               input_message_content: {
-                message_text: `<b>Q:</b> ${escapeHtml(queryText)}`,
+                message_text: `<b>Q:</b> ${escapeHtml(queryText)}\n\n<i>⏳ Thinking…</i>`,
                 parse_mode: "HTML",
               },
               reply_markup: researchMarkup,
@@ -2359,7 +2372,53 @@ export const registerTelegramHandlers = ({
             ),
           );
         });
+
+      // Fire-and-forget: wait for LLM + inline_message_id, then edit the message automatically.
+      void Promise.all([llmPromise, inlineMessageIdPromise])
+        .then(async ([answer, inlineMessageId]) => {
+          clearTimeout(autoEditCleanup);
+          autoEditPending.delete(query.id);
+          const queryHtml = escapeHtml(queryText);
+          const answerHtml = answer ? markdownToTelegramHtml(answer, {}) : "";
+          const finalMsg = answerHtml
+            ? `<b>Q:</b> ${queryHtml}\n\n<b>A:</b> ${answerHtml}`.slice(0, 4096)
+            : `<b>Q:</b> ${queryHtml}\n\n<i>No response generated.</i>`;
+          await bot.api
+            .editMessageTextInline(inlineMessageId, finalMsg, {
+              parse_mode: "HTML",
+              reply_markup: researchMarkup,
+            })
+            .then(() =>
+              runtime.log?.(
+                `[telegram] inline_query: auto-edited fallback message for query_id=${query.id}`,
+              ),
+            )
+            .catch((err) =>
+              runtime.error?.(
+                danger(
+                  `[telegram] inline_query: auto-edit failed for query_id=${query.id}: ${String(err)}`,
+                ),
+              ),
+            );
+        })
+        .catch((err) =>
+          runtime.error?.(
+            danger(`[telegram] inline_query: auto-edit pipeline failed query_id=${query.id}: ${String(err)}`),
+          ),
+        );
     }
+  });
+
+  bot.on("chosen_inline_result", async (ctx) => {
+    const result = ctx.chosenInlineResult;
+    if (!result?.inline_message_id) return;
+    const resolve = autoEditPending.get(result.result_id);
+    if (!resolve) return;
+    autoEditPending.delete(result.result_id);
+    resolve(result.inline_message_id);
+    runtime.log?.(
+      `[telegram] chosen_inline_result: resolved auto-edit for result_id=${result.result_id}`,
+    );
   });
 
   // ─────────────────────────────────────────────────────────────────────────
