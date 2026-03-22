@@ -2547,6 +2547,9 @@ export const registerTelegramHandlers = ({
 
   bot.on("chosen_inline_result", async (ctx) => {
     const result = ctx.chosenInlineResult;
+    runtime.log?.(
+      `[telegram] chosen_inline_result: received result_id=${result?.result_id} has_inline_msg=${Boolean(result?.inline_message_id)}`,
+    );
     if (!result?.inline_message_id) return;
     const queryId = result.result_id;
     const entry = autoEditPending.get(queryId);
