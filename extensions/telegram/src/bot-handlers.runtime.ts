@@ -2234,13 +2234,6 @@ export const registerTelegramHandlers = ({
         runtime.error?.(danger(`[telegram] inline: failed updating session meta: ${String(err)}`)),
     });
 
-    // Pin inline sessions to a fast model for low-latency responses
-    updateSessionStore(storePath, (store) => {
-      const entry = store[sessionKey] ?? {};
-      store[sessionKey] = { ...entry, modelOverride: "anthropic/claude-haiku-4-5" };
-      return store;
-    });
-
     const capturedReplies: string[] = [];
     const ctxPayload = finalizeInboundContext({
       Body: body,
