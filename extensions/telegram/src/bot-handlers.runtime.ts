@@ -2196,15 +2196,18 @@ export const registerTelegramHandlers = ({
         From: `telegram:${senderId}`,
         To: `telegram:${senderId}`,
         ChatType: "inline" as const,
-        SenderName: senderName,
+        SenderName:
+          [query.from?.first_name, query.from?.last_name].filter(Boolean).join(" ") ||
+          senderUsername ||
+          senderId,
         SenderId: senderId || undefined,
         Surface: "telegram",
         Provider: "telegram",
         MessageSid: query.id,
         Timestamp: Date.now(),
         WasMentioned: true,
-        SessionKey: sessionKey,
-        AccountId: route.accountId,
+        SessionKey: `inline:image:${senderId}`,
+        AccountId: accountId,
         OriginatingChannel: "telegram",
         OriginatingTo: `telegram:${senderId}`,
       });
