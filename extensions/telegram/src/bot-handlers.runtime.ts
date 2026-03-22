@@ -2275,7 +2275,7 @@ export const registerTelegramHandlers = ({
         return "";
       });
 
-    const TELEGRAM_DEADLINE_MS = 4000;
+    const TELEGRAM_DEADLINE_MS = 8000;
     const PREVIEW_TIMEOUT_MS = Math.max(500, TELEGRAM_DEADLINE_MS - (Date.now() - receivedAt));
     const fastResponse = await Promise.race([
       llmPromise,
