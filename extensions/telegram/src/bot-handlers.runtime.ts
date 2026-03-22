@@ -2267,7 +2267,7 @@ export const registerTelegramHandlers = ({
           runtime.error?.(danger(`[telegram] inline query dispatch failed: ${String(err)}`));
         },
       },
-      replyOptions: {},
+      replyOptions: { bootstrapContextMode: "lightweight" },
     })
       .then(() => capturedReplies.join("\n\n").trim())
       .catch((err) => {
