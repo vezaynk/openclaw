@@ -2403,7 +2403,9 @@ export const registerTelegramHandlers = ({
         })
         .catch((err) =>
           runtime.error?.(
-            danger(`[telegram] inline_query: auto-edit pipeline failed query_id=${query.id}: ${String(err)}`),
+            danger(
+              `[telegram] inline_query: auto-edit pipeline failed query_id=${query.id}: ${String(err)}`,
+            ),
           ),
         );
     }
