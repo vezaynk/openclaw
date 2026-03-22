@@ -2206,6 +2206,7 @@ export const registerTelegramHandlers = ({
       envelope: envelopeOptions,
     });
 
+    const t0 = Date.now();
     await recordInboundSessionMetaSafe({
       cfg,
       agentId: route.agentId,
@@ -2233,6 +2234,8 @@ export const registerTelegramHandlers = ({
       onError: (err) =>
         runtime.error?.(danger(`[telegram] inline: failed updating session meta: ${String(err)}`)),
     });
+    const t1 = Date.now();
+    runtime.info?.(`[telegram/inline/timing] recordSessionMeta: ${t1 - t0}ms`);
 
     const capturedReplies: string[] = [];
     const ctxPayload = finalizeInboundContext({
@@ -2256,6 +2259,7 @@ export const registerTelegramHandlers = ({
       OriginatingTo: `telegram:${senderId}`,
     });
 
+    const t2 = Date.now();
     const llmPromise = dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
       cfg,
@@ -2274,6 +2278,10 @@ export const registerTelegramHandlers = ({
         runtime.error?.(danger(`[telegram] inline LLM failed: ${String(err)}`));
         return "";
       });
+    llmPromise.then(() => {
+      const t3 = Date.now();
+      runtime.info?.(`[telegram/inline/timing] llmDispatch: ${t3 - t2}ms (total: ${t3 - t0}ms)`);
+    });
 
     const TELEGRAM_DEADLINE_MS = 8000;
     const PREVIEW_TIMEOUT_MS = Math.max(500, TELEGRAM_DEADLINE_MS - (Date.now() - receivedAt));
@@ -2281,6 +2289,10 @@ export const registerTelegramHandlers = ({
       llmPromise,
       new Promise<null>((resolve) => setTimeout(() => resolve(null), PREVIEW_TIMEOUT_MS)),
     ]);
+    const tRace = Date.now();
+    runtime.info?.(
+      `[telegram/inline/timing] raceTimeout: ${PREVIEW_TIMEOUT_MS}ms, result: ${fastResponse ? "llm-won" : "timeout"}, elapsed: ${tRace - t0}ms`,
+    );
 
     const shortQuery = queryText.length > 50 ? queryText.slice(0, 50) + "..." : queryText;
     const researchMarkup = buildResearchMarkup(query.id);
