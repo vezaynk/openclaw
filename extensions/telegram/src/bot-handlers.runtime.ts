@@ -1268,7 +1268,7 @@ export const registerTelegramHandlers = ({
                   .editMessageTextInline(
                     inlineMessageId,
                     isImageIntent
-                      ? `<b>Q:</b> ${queryHtml}\n\n<i>🖌️ Drawing…</i>`
+                      ? `<b>Q:</b> ${queryHtml}\n\n<i>🖌️ Generating… ${frame}</i>`
                       : `<b>Q:</b> ${queryHtml}\n\n<i>🔍 Researching… ${frame}</i>`,
                     { parse_mode: "HTML", reply_markup: { inline_keyboard: [] } },
                   )
@@ -2440,6 +2440,24 @@ export const registerTelegramHandlers = ({
           let detectedImagePath: string | null = null;
           let streamText = "";
           const FILE_LINE_RE = /^FILE:\s*(.+)$/m;
+
+          // Spinner while generating
+          const SPINNER_FRAMES_IMG = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+          let spinnerIdxImg = 0;
+          let spinnerActiveImg = true;
+          const spinnerIntervalImg = setInterval(() => {
+            if (!spinnerActiveImg) return;
+            spinnerIdxImg = (spinnerIdxImg + 1) % SPINNER_FRAMES_IMG.length;
+            const frame = SPINNER_FRAMES_IMG[spinnerIdxImg];
+            bot.api
+              .editMessageTextInline(
+                inlineMessageId,
+                `<b>🎨 ${queryHtml}</b>\n\n<i>🖌️ Generating… ${frame}</i>`,
+                { parse_mode: "HTML" },
+              )
+              .catch(() => {});
+          }, 1000);
+
           await dispatchReplyWithBufferedBlockDispatcher({
             ctx: researchCtx,
             cfg,
@@ -2458,6 +2476,8 @@ export const registerTelegramHandlers = ({
           }).catch((err) =>
             runtime.error?.(danger(`[telegram] inline image dispatch error: ${String(err)}`)),
           );
+          spinnerActiveImg = false;
+          clearInterval(spinnerIntervalImg);
 
           if (detectedImagePath) {
             try {
