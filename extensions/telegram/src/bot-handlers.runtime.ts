@@ -2146,17 +2146,22 @@ export const registerTelegramHandlers = ({
     if (INLINE_IMAGE_INTENT_RE.test(queryText)) {
       const shortQuery2 = queryText.length > 50 ? queryText.slice(0, 50) + "..." : queryText;
       const inlineQueryHtml2 = escapeHtml(queryText);
-      // Key by both query.id AND senderId so chosen_inline_result can find it regardless
-      // of which query.id Telegram reports back (may differ due to debounce)
-      const researchCleanup2 = setTimeout(
+
+      // Register in autoEditPending — same pattern as text path
+      const inlineMessageIdPromise = new Promise<string>((resolve, reject) => {
+        autoEditPending.set(query.id, { resolve, reject });
+      });
+      const autoEditCleanup2 = setTimeout(
         () => {
-          researchPending.delete(query.id);
-          researchPending.delete(`sender:${senderId}`);
+          const entry = autoEditPending.get(query.id);
+          if (entry) {
+            autoEditPending.delete(query.id);
+            entry.reject(new Error("inline_message_id never received"));
+          }
         },
         10 * 60 * 1000,
       );
-      researchPending.set(query.id, { queryText, cleanupTimer: researchCleanup2 });
-      researchPending.set(`sender:${senderId}`, { queryText, cleanupTimer: researchCleanup2 });
+
       await bot.api
         .answerInlineQuery(
           query.id,
@@ -2179,6 +2184,140 @@ export const registerTelegramHandlers = ({
             danger(`[telegram] answerInlineQuery (image placeholder) failed: ${String(err)}`),
           );
         });
+
+      // Fire image generation in background — waits for inline_message_id via autoEditPending
+      const sanitizedQuery = queryText.replace(/[`$\\|&;(){}<>!]/g, "");
+      const imageQueryHtml = escapeHtml(queryText);
+      const researchInstruction = `Generate an image for the following request. Use the nano-banana-pro skill (run ~/.local/bin/uv run ~/.openclaw/workspace/skills/nano-banana-pro/scripts/generate_image.py with appropriate args). Output the image file path on a line starting with FILE: \n\n${sanitizedQuery}`;
+      const researchCtx = finalizeInboundContext({
+        Body: researchInstruction,
+        BodyForAgent: researchInstruction,
+        RawBody: sanitizedQuery,
+        From: `telegram:${senderId}`,
+        To: `telegram:${senderId}`,
+        ChatType: "inline" as const,
+        SenderName: senderName,
+        SenderId: senderId || undefined,
+        Surface: "telegram",
+        Provider: "telegram",
+        MessageSid: query.id,
+        Timestamp: Date.now(),
+        WasMentioned: true,
+        SessionKey: sessionKey,
+        AccountId: route.accountId,
+        OriginatingChannel: "telegram",
+        OriginatingTo: `telegram:${senderId}`,
+      });
+
+      void (async () => {
+        let detectedImagePath: string | null = null;
+        let streamText = "";
+        const FILE_LINE_RE = /^FILE:\s*(.+)$/m;
+
+        // Start generation and wait for inline_message_id in parallel
+        const genPromise = dispatchReplyWithBufferedBlockDispatcher({
+          ctx: researchCtx,
+          cfg,
+          dispatcherOptions: {
+            deliver: async (payload) => {
+              if (!payload.text) return;
+              const fileMatch = FILE_LINE_RE.exec(payload.text);
+              if (fileMatch) detectedImagePath = fileMatch[1];
+              const cleaned = payload.text.replace(FILE_LINE_RE, "").trim();
+              if (cleaned) streamText += (streamText ? "\n\n" : "") + cleaned;
+            },
+            onError: (err) =>
+              runtime.error?.(danger(`[telegram] inline image dispatch failed: ${String(err)}`)),
+          },
+          replyOptions: {},
+        }).catch((err) => {
+          runtime.error?.(danger(`[telegram] inline image dispatch error: ${String(err)}`));
+        });
+
+        // Wait for both generation to finish AND user to select the result
+        let inlineMessageId: string;
+        try {
+          const [, msgId] = await Promise.all([genPromise, inlineMessageIdPromise]);
+          clearTimeout(autoEditCleanup2);
+          autoEditPending.delete(query.id);
+          inlineMessageId = msgId;
+        } catch {
+          clearTimeout(autoEditCleanup2);
+          autoEditPending.delete(query.id);
+          runtime.log?.(
+            `[telegram] inline image: abandoned (user never selected) query_id=${query.id}`,
+          );
+          return;
+        }
+
+        // Start spinner now that we have the inline_message_id
+        const SPINNER_FRAMES_IMG = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let spinnerIdxImg = 0;
+        let spinnerActiveImg = !detectedImagePath;
+        const spinnerIntervalImg = setInterval(() => {
+          if (!spinnerActiveImg) return;
+          spinnerIdxImg = (spinnerIdxImg + 1) % SPINNER_FRAMES_IMG.length;
+          const frame = SPINNER_FRAMES_IMG[spinnerIdxImg];
+          bot.api
+            .editMessageTextInline(
+              inlineMessageId,
+              `<b>🎨 ${imageQueryHtml}</b>\n\n<i>🖌️ Generating… ${frame}</i>`,
+              { parse_mode: "HTML" },
+            )
+            .catch(() => {});
+        }, 1000);
+
+        // Wait for gen to finish if not already done
+        await genPromise;
+        spinnerActiveImg = false;
+        clearInterval(spinnerIntervalImg);
+
+        if (detectedImagePath) {
+          try {
+            const sent = await bot.api.sendPhoto(
+              Number(senderId),
+              new InputFile(detectedImagePath),
+              { caption: streamText.trim() || queryText, disable_notification: true },
+            );
+            const fileId = sent.photo.at(-1)!.file_id;
+            await bot.api.deleteMessage(Number(senderId), sent.message_id).catch(() => {});
+            await bot.api
+              .editMessageMediaInline(inlineMessageId, {
+                type: "photo",
+                media: fileId,
+                caption: streamText.trim() || queryText,
+              })
+              .then(() => runtime.log?.(`[telegram] inline image: edit ok query_id=${query.id}`))
+              .catch((err) =>
+                runtime.error?.(
+                  danger(
+                    `[telegram] inline image: edit failed query_id=${query.id}: ${String(err)}`,
+                  ),
+                ),
+              );
+          } catch (err) {
+            await bot.api
+              .editMessageTextInline(
+                inlineMessageId,
+                `<b>🎨 ${imageQueryHtml}</b>\n\n<i>Image generation failed.</i>`,
+                { parse_mode: "HTML", reply_markup: { inline_keyboard: [] } },
+              )
+              .catch(() => {});
+          }
+        } else {
+          const finalHtml = streamText ? markdownToTelegramHtml(streamText, {}) : "";
+          await bot.api
+            .editMessageTextInline(
+              inlineMessageId,
+              finalHtml
+                ? `<b>🎨 ${imageQueryHtml}</b>\n\n<b>A:</b> ${finalHtml}`.slice(0, 4096)
+                : `<b>🎨 ${imageQueryHtml}</b>\n\n<i>Image generation failed.</i>`,
+              { parse_mode: "HTML", reply_markup: { inline_keyboard: [] } },
+            )
+            .catch(() => {});
+        }
+        runtime.log?.(`[telegram] inline image: done query_id=${query.id}`);
+      })();
       return;
     }
 
@@ -2406,146 +2545,12 @@ export const registerTelegramHandlers = ({
   bot.on("chosen_inline_result", async (ctx) => {
     const result = ctx.chosenInlineResult;
     if (!result?.inline_message_id) return;
-    const inlineMessageId = result.inline_message_id;
     const queryId = result.result_id;
-    const senderId = String(result.from?.id ?? "");
-
-    // Image intent: kick off generation directly from chosen_inline_result
-    // Fall back to sender key since debounce may cause query.id mismatch
-    const imagePending = researchPending.get(queryId) ?? researchPending.get(`sender:${senderId}`);
-    if (imagePending) {
-      clearTimeout(imagePending.cleanupTimer);
-      researchPending.delete(queryId);
-      researchPending.delete(`sender:${senderId}`);
-      const rawQueryText = imagePending.queryText;
-      const queryText = rawQueryText.replace(/[`$\\|&;(){}<>!]/g, "");
-      const queryHtml = escapeHtml(queryText);
-      const IMAGE_INTENT_RE =
-        /\b(draw|paint|generat|creat|make|design|render|sketch|image|picture|photo|pic|illustrat|artwork|art|visuali|anime|cartoon)\w*\b/i;
-      if (IMAGE_INTENT_RE.test(queryText)) {
-        runtime.log?.(`[telegram] inline image: starting generation for query_id=${queryId}`);
-        // Kick off image generation in background (reuse research dispatch)
-        const imageResearchPrompt = `Generate an image: ${queryText}`;
-        const sanitizedQuery = queryText;
-        const researchInstruction = `Generate an image for the following request. Use the nano-banana-pro skill (run ~/.local/bin/uv run ~/.openclaw/workspace/skills/nano-banana-pro/scripts/generate_image.py with appropriate args). Output the image file path on a line starting with FILE: \n\n${sanitizedQuery}`;
-        const researchCtx = finalizeInboundContext({
-          Body: researchInstruction,
-          BodyForAgent: researchInstruction,
-          RawBody: sanitizedQuery,
-          From: `telegram:${senderId}`,
-          To: `telegram:${senderId}`,
-          ChatType: "inline" as const,
-          SenderName: senderId,
-          SenderId: senderId || undefined,
-          Surface: "telegram",
-          Provider: "telegram",
-          MessageSid: queryId,
-          Timestamp: Date.now(),
-          WasMentioned: true,
-          SessionKey: `inline:${senderId}`,
-          AccountId: accountId,
-          OriginatingChannel: "telegram",
-          OriginatingTo: `telegram:${senderId}`,
-        });
-        void (async () => {
-          let detectedImagePath: string | null = null;
-          let streamText = "";
-          const FILE_LINE_RE = /^FILE:\s*(.+)$/m;
-
-          // Spinner while generating
-          const SPINNER_FRAMES_IMG = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-          let spinnerIdxImg = 0;
-          let spinnerActiveImg = true;
-          const spinnerIntervalImg = setInterval(() => {
-            if (!spinnerActiveImg) return;
-            spinnerIdxImg = (spinnerIdxImg + 1) % SPINNER_FRAMES_IMG.length;
-            const frame = SPINNER_FRAMES_IMG[spinnerIdxImg];
-            bot.api
-              .editMessageTextInline(
-                inlineMessageId,
-                `<b>🎨 ${queryHtml}</b>\n\n<i>🖌️ Generating… ${frame}</i>`,
-                { parse_mode: "HTML" },
-              )
-              .catch(() => {});
-          }, 1000);
-
-          await dispatchReplyWithBufferedBlockDispatcher({
-            ctx: researchCtx,
-            cfg,
-            dispatcherOptions: {
-              deliver: async (payload) => {
-                if (!payload.text) return;
-                const fileMatch = FILE_LINE_RE.exec(payload.text);
-                if (fileMatch) detectedImagePath = fileMatch[1];
-                const cleaned = payload.text.replace(FILE_LINE_RE, "").trim();
-                if (cleaned) streamText += (streamText ? "\n\n" : "") + cleaned;
-              },
-              onError: (err) =>
-                runtime.error?.(danger(`[telegram] inline image dispatch failed: ${String(err)}`)),
-            },
-            replyOptions: {},
-          }).catch((err) =>
-            runtime.error?.(danger(`[telegram] inline image dispatch error: ${String(err)}`)),
-          );
-          spinnerActiveImg = false;
-          clearInterval(spinnerIntervalImg);
-
-          if (detectedImagePath) {
-            try {
-              const sent = await bot.api.sendPhoto(
-                Number(senderId),
-                new InputFile(detectedImagePath),
-                { caption: streamText.trim() || queryText, disable_notification: true },
-              );
-              const fileId = sent.photo.at(-1)!.file_id;
-              await bot.api.deleteMessage(Number(senderId), sent.message_id).catch(() => {});
-              await bot.api
-                .editMessageMediaInline(inlineMessageId, {
-                  type: "photo",
-                  media: fileId,
-                  caption: streamText.trim() || queryText,
-                })
-                .then(() => runtime.log?.(`[telegram] inline image: edit ok query_id=${queryId}`))
-                .catch((err) =>
-                  runtime.error?.(
-                    danger(
-                      `[telegram] inline image: edit failed query_id=${queryId}: ${String(err)}`,
-                    ),
-                  ),
-                );
-            } catch (err) {
-              const fallbackMsg = `<b>Q:</b> ${queryHtml}\n\n<i>Image generation failed.</i>`;
-              await bot.api
-                .editMessageTextInline(inlineMessageId, fallbackMsg, {
-                  parse_mode: "HTML",
-                  reply_markup: { inline_keyboard: [] },
-                })
-                .catch(() => {});
-            }
-          } else {
-            const finalHtml = streamText ? markdownToTelegramHtml(streamText, {}) : "";
-            const fallbackMsg = finalHtml
-              ? `<b>Q:</b> ${queryHtml}\n\n<b>A:</b> ${finalHtml}`.slice(0, 4096)
-              : `<b>Q:</b> ${queryHtml}\n\n<i>Image generation failed.</i>`;
-            await bot.api
-              .editMessageTextInline(inlineMessageId, fallbackMsg, {
-                parse_mode: "HTML",
-                reply_markup: { inline_keyboard: [] },
-              })
-              .catch(() => {});
-          }
-          runtime.log?.(`[telegram] inline image: done query_id=${queryId}`);
-        })();
-        return;
-      }
-    }
-
-    // Text auto-edit: resolve pending LLM promise with inline_message_id
     const entry = autoEditPending.get(queryId);
     if (!entry) return;
     autoEditPending.delete(queryId);
-    entry.resolve(inlineMessageId);
-    runtime.log?.(`[telegram] chosen_inline_result: resolved auto-edit for result_id=${queryId}`);
+    entry.resolve(result.inline_message_id);
+    runtime.log?.(`[telegram] chosen_inline_result: resolved for result_id=${queryId}`);
   });
 
   // ─────────────────────────────────────────────────────────────────────────
