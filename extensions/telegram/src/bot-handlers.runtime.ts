@@ -2235,7 +2235,7 @@ export const registerTelegramHandlers = ({
         runtime.error?.(danger(`[telegram] inline: failed updating session meta: ${String(err)}`)),
     });
     const t1 = Date.now();
-    runtime.info?.(`[telegram/inline/timing] recordSessionMeta: ${t1 - t0}ms`);
+    runtime.log?.(`[telegram/inline/timing] recordSessionMeta: ${t1 - t0}ms`);
 
     const capturedReplies: string[] = [];
     const ctxPayload = finalizeInboundContext({
@@ -2280,7 +2280,7 @@ export const registerTelegramHandlers = ({
       });
     llmPromise.then(() => {
       const t3 = Date.now();
-      runtime.info?.(`[telegram/inline/timing] llmDispatch: ${t3 - t2}ms (total: ${t3 - t0}ms)`);
+      runtime.log?.(`[telegram/inline/timing] llmDispatch: ${t3 - t2}ms (total: ${t3 - t0}ms)`);
     });
 
     const TELEGRAM_DEADLINE_MS = 8000;
@@ -2290,7 +2290,7 @@ export const registerTelegramHandlers = ({
       new Promise<null>((resolve) => setTimeout(() => resolve(null), PREVIEW_TIMEOUT_MS)),
     ]);
     const tRace = Date.now();
-    runtime.info?.(
+    runtime.log?.(
       `[telegram/inline/timing] raceTimeout: ${PREVIEW_TIMEOUT_MS}ms, result: ${fastResponse ? "llm-won" : "timeout"}, elapsed: ${tRace - t0}ms`,
     );
 
