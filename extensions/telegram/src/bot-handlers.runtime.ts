@@ -2146,8 +2146,17 @@ export const registerTelegramHandlers = ({
     if (INLINE_IMAGE_INTENT_RE.test(queryText)) {
       const shortQuery2 = queryText.length > 50 ? queryText.slice(0, 50) + "..." : queryText;
       const inlineQueryHtml2 = escapeHtml(queryText);
-      const researchCleanup2 = setTimeout(() => researchPending.delete(query.id), 10 * 60 * 1000);
+      // Key by both query.id AND senderId so chosen_inline_result can find it regardless
+      // of which query.id Telegram reports back (may differ due to debounce)
+      const researchCleanup2 = setTimeout(
+        () => {
+          researchPending.delete(query.id);
+          researchPending.delete(`sender:${senderId}`);
+        },
+        10 * 60 * 1000,
+      );
       researchPending.set(query.id, { queryText, cleanupTimer: researchCleanup2 });
+      researchPending.set(`sender:${senderId}`, { queryText, cleanupTimer: researchCleanup2 });
       await bot.api
         .answerInlineQuery(
           query.id,
@@ -2402,10 +2411,12 @@ export const registerTelegramHandlers = ({
     const senderId = String(result.from?.id ?? "");
 
     // Image intent: kick off generation directly from chosen_inline_result
-    const imagePending = researchPending.get(queryId);
+    // Fall back to sender key since debounce may cause query.id mismatch
+    const imagePending = researchPending.get(queryId) ?? researchPending.get(`sender:${senderId}`);
     if (imagePending) {
       clearTimeout(imagePending.cleanupTimer);
       researchPending.delete(queryId);
+      researchPending.delete(`sender:${senderId}`);
       const rawQueryText = imagePending.queryText;
       const queryText = rawQueryText.replace(/[`$\\|&;(){}<>!]/g, "");
       const queryHtml = escapeHtml(queryText);
