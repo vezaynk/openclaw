@@ -505,6 +505,9 @@ export const registerTelegramHandlers = ({
     string,
     { resolve: (inlineMessageId: string) => void; reject: (reason?: unknown) => void }
   >();
+  // latestImageQueryBySender: tracks the latest active image query.id per sender so that
+  // if the user selects an older result, it still resolves the latest generation.
+  const latestImageQueryBySender = new Map<string, string>();
   // ─────────────────────────────────────────────────────────────────────────
 
   const resolveReplyMediaForMessage = async (
@@ -2065,12 +2068,17 @@ export const registerTelegramHandlers = ({
       const inlineMessageIdPromise = new Promise<string>((resolve, reject) => {
         autoEditPending.set(query.id, { resolve, reject });
       });
+      // Track latest image query per sender so older result picks resolve the newest gen
+      latestImageQueryBySender.set(senderId, query.id);
       const autoEditCleanup2 = setTimeout(
         () => {
           const entry = autoEditPending.get(query.id);
           if (entry) {
             autoEditPending.delete(query.id);
             entry.reject(new Error("inline_message_id never received"));
+          }
+          if (latestImageQueryBySender.get(senderId) === query.id) {
+            latestImageQueryBySender.delete(senderId);
           }
         },
         10 * 60 * 1000,
@@ -2484,12 +2492,26 @@ export const registerTelegramHandlers = ({
 
   bot.on("chosen_inline_result", async (ctx) => {
     const result = ctx.chosenInlineResult;
-    runtime.log?.(`[telegram] chosen_inline_result: raw=${JSON.stringify(result)}`);
     if (!result?.inline_message_id) return;
-    const queryId = result.result_id;
+    const senderId = String(result.from?.id ?? "");
+    let queryId = result.result_id;
+
+    // Fall back to latest active image query for this sender if the exact id isn't found
+    // (happens when user selects an older debounced result)
+    if (!autoEditPending.has(queryId)) {
+      const latestId = latestImageQueryBySender.get(senderId);
+      if (latestId && autoEditPending.has(latestId)) {
+        runtime.log?.(
+          `[telegram] chosen_inline_result: remapping ${queryId} → latest ${latestId} for sender ${senderId}`,
+        );
+        queryId = latestId;
+      }
+    }
+
     const entry = autoEditPending.get(queryId);
     if (!entry) return;
     autoEditPending.delete(queryId);
+    latestImageQueryBySender.delete(senderId);
     entry.resolve(result.inline_message_id);
     runtime.log?.(`[telegram] chosen_inline_result: resolved for result_id=${queryId}`);
   });
