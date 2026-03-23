@@ -2104,7 +2104,7 @@ export const registerTelegramHandlers = ({
         });
 
       // Fire image generation in background — waits for inline_message_id via autoEditPending
-      const sanitizedQuery = queryText.replace(/[`$\\|&;(){}<>!]/g, "");
+      const sanitizedQuery = queryText.replace(/[`$\\|&;(){}<>!\n\r]/g, " ").trim();
       const imageQueryHtml = escapeHtml(queryText);
       const homeDir2 = process.env.HOME ?? "/home/linuxuser";
       const nanobananaScript2 = `${homeDir2}/.openclaw/workspace/skills/nano-banana-pro/scripts/generate_image.py`;
